@@ -305,14 +305,17 @@ void dealWithInterface(io_service_t usbInterfaceRef)
     }
     err = (*intf)->USBInterfaceOpen(intf);
     if (err) {
-		fprintf(stderr, "dealWithInterface: unable to open interface. ret = %08x\n", err);
-		// Alas, this doesn't solve the problem in OS X 10.4.*
-		err = (*intf)->USBInterfaceOpenSeize(intf);
-		if (err) {
-			fprintf(stderr, "dealWithInterface: unable to seize interface. ret = %08x\n", err);
-			return;
-		}
-    }
+        if (err == kIOReturnExclusiveAccess && gVerbose) {
+            fprintf(stderr, "dealWithInterface: interface already in use (kIOReturnExclusiveAccess), continuing anyway.\n");
+     	} else {
+        	fprintf(stderr, "dealWithInterface: unable to open interface. ret = %08x\n", err);
+        	err = (*intf)->USBInterfaceOpenSeize(intf);
+        	if (err && err != kIOReturnExclusiveAccess) {
+            	fprintf(stderr, "dealWithInterface: unable to seize interface. ret = %08x\n", err);
+            	return;
+        	}
+    	}
+	}
 #ifdef VERBOSE
 	{
 		UInt8 numPipes;
