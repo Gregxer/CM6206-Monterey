@@ -86,18 +86,22 @@ static IONotificationPortRef	gNotifyPort;
 static io_iterator_t			gAddedIter;
 static CFRunLoopRef				gRunLoop;
 static int						gVerbose;
+static int                      gForceNonExclusive = 0;   // -f: allow init even if interface is in exclusive use
 
 
 void printUsage( const char *progName )
 {
-	printf("Usage: %s [-s] [-d] [-v] [-V]\n", progName );
-	printf("  Activates sound outputs on CM6206 USB devices.\n");
-	printf("  -s: Silent mode (default in daemon mode)\n");
-	printf("  -v: Verbose mode (default in non-daemon mode)\n");
-	printf("  -d: Daemon mode: the program keeps running and automatically activates any\n");
-	printf("      devices that are connected, or all devices upon wake-from-sleep.\n");
-	printf("  -V: Print version number and exit.\n");
+    printf("Usage: %s [-s] [-d] [-v] [-V] [-f]\n", progName );
+    printf("  Activates sound outputs on CM6206 USB devices.\n");
+    printf("  -s: Silent mode (default in daemon mode)\n");
+    printf("  -v: Verbose mode (default in non-daemon mode)\n");
+    printf("  -d: Daemon mode: the program keeps running and automatically activates any\n");
+    printf("      devices that are connected, or all devices upon wake-from-sleep.\n");
+    printf("  -f: Force mode: ignore exclusive-access errors and still send init commands\n");
+    printf("      (required on recent macOS where AppleUSBAudio grabs the device).\n");
+    printf("  -V: Print version number and exit.\n");
 }
+
 
 
 /**** Error handlers ****/
@@ -305,25 +309,42 @@ void dealWithInterface(io_service_t usbInterfaceRef)
     }
     err = (*intf)->USBInterfaceOpen(intf);
     if (err) {
-		fprintf(stderr, "dealWithInterface: unable to open interface. ret = %08x\n", err);
-		// Alas, this doesn't solve the problem in OS X 10.4.*
-		err = (*intf)->USBInterfaceOpenSeize(intf);
-		if (err) {
-			fprintf(stderr, "dealWithInterface: unable to seize interface. ret = %08x\n", err);
-			return;
-		}
+        if (err == kIOReturnExclusiveAccess && gForceNonExclusive) {
+            if (gVerbose) {
+                fprintf(stderr, "dealWithInterface: interface already in use (kIOReturnExclusiveAccess), continuing due to -f.\n");
+            }
+            // In force mode (-f), accept that the system audio driver holds the interface
+            // and still proceed to send the initialization commands.
+        } else {
+            fprintf(stderr, "dealWithInterface: unable to open interface. ret = %08x\n", err);
+
+            // Original behavior: try USBInterfaceOpenSeize as a fallback
+            // (this was mainly for older macOS versions).
+            err = (*intf)->USBInterfaceOpenSeize(intf);
+            if (err) {
+                if (err == kIOReturnExclusiveAccess && gForceNonExclusive) {
+                    if (gVerbose) {
+                        fprintf(stderr, "dealWithInterface: unable to seize interface exclusively (kIOReturnExclusiveAccess), continuing due to -f.\n");
+                    }
+                    // In force mode we also accept exclusive-access errors here and continue.
+                } else {
+                    fprintf(stderr, "dealWithInterface: unable to seize interface. ret = %08x\n", err);
+                    return;
+                }
+            }
+        }
     }
+
 #ifdef VERBOSE
-	{
-		UInt8 numPipes;
-		err = (*intf)->GetNumEndpoints(intf, &numPipes);
-		if (err) {
-			fprintf(stderr, "dealWithInterface: unable to get number of endpoints. ret = %08x\n", err);
-			(*intf)->USBInterfaceClose(intf);
-			(*intf)->Release(intf);
-			return;
-		}
-		fprintf(stderr, "numPipes = %d\n", numPipes);
+    err = (*intf)->USBInterfaceClose(intf);
+    if (err && (!gForceNonExclusive || err != kIOReturnNotOpen)) {
+        fprintf(stderr, "dealWithInterface: unable to close interface. ret = %08x\n", err);
+        // Do not return here; we still try to release the interface object.
+    }
+    err = (*intf)->Release(intf);
+    if (err) {
+        fprintf(stderr, "dealWithInterface: unable to release interface. ret = %08x\n", err);
+        return;
     }
 #endif
 
@@ -684,31 +705,33 @@ void powerCallback(void *rootPort, io_service_t y, natural_t msgType, void *msgA
 //
 int main(int argc, const char * argv[])
 {
-	int					bDaemon = 0;
-    sig_t				oldHandler;
-	gVerbose = 1;
-	
-	for( int a=1; a<argc; a++ ) {
-		if( strcmp( argv[a], "-d" ) == 0 ) {
-			bDaemon = 1;
-			gVerbose = 0;
-		}
-		else if( strcmp( argv[a], "-v" ) == 0 )
-			gVerbose = 1;
-		else if( strcmp( argv[a], "-s" ) == 0 )
-			gVerbose = 0;
-		else if( strcmp( argv[a], "-V" ) == 0 ) {
-			printf( "CM6206Init version %s\n", CMVERSION );
-			return 0;
-		}
-		else if( strcmp( argv[a], "-h" ) == 0 ) {
-			printUsage(argv[0]);
-			return 0;
-		}
-		else {
-			fprintf(stderr, "Ignoring unknown argument `%s'\n", (argv[a]));
-		}
-	}
+    int                 bDaemon = 0;
+    sig_t               oldHandler;
+    gVerbose = 1;
+
+    for( int a=1; a<argc; a++ ) {
+        if( strcmp( argv[a], "-d" ) == 0 ) {
+            bDaemon = 1;
+            gVerbose = 0;
+        }
+        else if( strcmp( argv[a], "-v" ) == 0 )
+            gVerbose = 1;
+        else if( strcmp( argv[a], "-s" ) == 0 )
+            gVerbose = 0;
+        else if( strcmp( argv[a], "-f" ) == 0 )
+            gForceNonExclusive = 1;
+        else if( strcmp( argv[a], "-V" ) == 0 ) {
+            printf( "CM6206Init version %s\n", CMVERSION );
+            return 0;
+        }
+        else if( strcmp( argv[a], "-h" ) == 0 ) {
+            printUsage(argv[0]);
+            return 0;
+        }
+        else {
+            fprintf(stderr, "Ignoring unknown argument `%s'\n", (argv[a]));
+        }
+    }
 	
 	
 	// Set up a signal handler so we can clean up when we're interrupted from the command line
